@@ -1,0 +1,281 @@
+package com.example.myapplication;
+
+import androidx.appcompat.app.AppCompatActivity;
+
+import android.content.SharedPreferences;
+import android.media.AudioFormat;
+import android.media.AudioManager;
+import android.media.AudioTrack;
+import android.os.Bundle;
+import android.util.Log;
+import android.view.WindowManager;
+import android.widget.Button;
+import android.widget.EditText;
+import android.widget.TextView;
+import java.math.BigInteger;
+
+public class MainActivity extends AppCompatActivity {
+
+    private static final String TAG = "PiSound";
+    private static final String PREF_NAME = "PiStatePrefs";
+    private static final int SAMPLE_RATE = 44100;
+    
+    // 五线谱音阶频率映射 (从中央 C 开始的 C 大调音阶)
+    private static final double[] FREQUENCIES = {
+        261.63, // 0 -> C4 (Do)
+        293.66, // 1 -> D4 (Re)
+        329.63, // 2 -> E4 (Mi)
+        349.23, // 3 -> F4 (Fa)
+        392.00, // 4 -> G4 (Sol)
+        440.00, // 5 -> A4 (La)
+        493.88, // 6 -> B4 (Si)
+        523.25, // 7 -> C5 (高音 Do)
+        587.33, // 8 -> D5 (高音 Re)
+        659.25  // 9 -> E5 (高音 Mi)
+    };
+    
+    // 播放时长 (pi 秒)
+    private static final double DURATION = 0.31415926;
+
+    private volatile boolean isPlaying = false;
+    private Thread playThread;
+    private PiGenerator piGenerator;
+    
+    private Button btnStart, btnPause, btnResume, btnRestart;
+    private TextView tvCurrentDigit;
+    private EditText etGapDigit;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        setContentView(R.layout.activity_main);
+
+        btnStart = findViewById(R.id.btn_start);
+        btnPause = findViewById(R.id.btn_pause);
+        btnResume = findViewById(R.id.btn_resume);
+        btnRestart = findViewById(R.id.btn_restart);
+        tvCurrentDigit = findViewById(R.id.tv_current_digit);
+        etGapDigit = findViewById(R.id.et_gap_digit);
+
+        loadSavedState();
+
+        btnStart.setOnClickListener(v -> {
+            if (!isPlaying) startPlayback();
+            else stopPlayback();
+        });
+
+        btnPause.setOnClickListener(v -> pausePlayback());
+        btnResume.setOnClickListener(v -> resumePlayback());
+        btnRestart.setOnClickListener(v -> resetAndStart());
+    }
+
+    private void startPlayback() {
+        isPlaying = true;
+        if (piGenerator == null) {
+            piGenerator = new PiGenerator();
+            piGenerator.nextDigit();
+        }
+        btnStart.setText("停止程序");
+        btnPause.setEnabled(true);
+        btnResume.setEnabled(false);
+        startPiThread();
+    }
+
+    private void stopPlayback() {
+        isPlaying = false;
+        if (playThread != null) playThread.interrupt();
+        btnStart.setText("启动程序");
+        btnPause.setEnabled(false);
+        btnResume.setEnabled(false);
+    }
+
+    private void pausePlayback() {
+        isPlaying = false;
+        if (playThread != null) playThread.interrupt();
+        btnPause.setEnabled(false);
+        btnResume.setEnabled(true);
+        btnStart.setText("启动程序");
+    }
+
+    private void resumePlayback() {
+        isPlaying = true;
+        btnPause.setEnabled(true);
+        btnResume.setEnabled(false);
+        btnStart.setText("停止程序");
+        startPiThread();
+    }
+
+    private void resetAndStart() {
+        isPlaying = false;
+        if (playThread != null) playThread.interrupt();
+        clearSavedState();
+        piGenerator = null;
+        tvCurrentDigit.setText("计算中...");
+        isPlaying = true;
+        btnStart.setText("停止程序");
+        btnPause.setEnabled(true);
+        btnResume.setEnabled(false);
+        startPiThread();
+    }
+
+    private void startPiThread() {
+        if (playThread != null && playThread.isAlive()) playThread.interrupt();
+
+        playThread = new Thread(() -> {
+            AudioTrack audioTrack = null;
+            try {
+                if (piGenerator == null) {
+                    piGenerator = new PiGenerator();
+                    piGenerator.nextDigit();
+                }
+
+                int minBufSize = AudioTrack.getMinBufferSize(SAMPLE_RATE, 
+                        AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
+                
+                audioTrack = new AudioTrack(
+                        AudioManager.STREAM_MUSIC,
+                        SAMPLE_RATE,
+                        AudioFormat.CHANNEL_OUT_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT,
+                        Math.max(minBufSize, 8192),
+                        AudioTrack.MODE_STREAM);
+
+                audioTrack.play();
+
+                while (isPlaying && !Thread.currentThread().isInterrupted()) {
+                    int digit = piGenerator.nextDigit();
+                    double freq = FREQUENCIES[digit]; 
+                    
+                    saveCurrentState(digit);
+                    final String digitStr = String.valueOf(digit);
+                    runOnUiThread(() -> tvCurrentDigit.setText(digitStr));
+
+                    // 1. 播放音符
+                    playWaveToTrack(audioTrack, DURATION, freq);
+                    
+                    // 2. 播放静音（代替 Thread.sleep）
+                    if (isPlaying) {
+                        long gapMicro = 500000; 
+                        try {
+                            gapMicro = Long.parseLong(etGapDigit.getText().toString());
+                        } catch (Exception ignored) {}
+                        
+                        playSilenceToTrack(audioTrack, gapMicro);
+                    }
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "运行错误", e);
+            } finally {
+                if (audioTrack != null) {
+                    try { audioTrack.stop(); audioTrack.release(); } catch (Exception ignored) {}
+                }
+            }
+        });
+        playThread.start();
+    }
+
+    private void playWaveToTrack(AudioTrack track, double duration, double freq) {
+        int numSamples = (int) (duration * SAMPLE_RATE);
+        short[] buffer = new short[numSamples];
+        
+        // 40ms 的淡入淡出，极其平滑
+        int fadeSamples = (int) (0.040 * SAMPLE_RATE); 
+        fadeSamples = Math.min(fadeSamples, numSamples / 2);
+        
+        for (int i = 0; i < numSamples; i++) {
+            double angle = 2.0 * Math.PI * freq * i / SAMPLE_RATE;
+            double sampleValue = Math.sin(angle);
+            
+            double envelope = 1.0;
+            if (i < fadeSamples) {
+                envelope = (double) i / fadeSamples;
+            } else if (i > numSamples - fadeSamples) {
+                envelope = (double) (numSamples - 1 - i) / fadeSamples;
+            }
+            
+
+            buffer[i] = (short) (sampleValue * envelope * 25000);
+        }
+        
+        track.write(buffer, 0, buffer.length);
+    }
+
+    private void playSilenceToTrack(AudioTrack track, long gapMicro) {
+        int numSamples = (int) ((gapMicro / 1000000.0) * SAMPLE_RATE);
+        if (numSamples <= 0) return;
+        
+        short[] buffer = new short[numSamples]; 
+        
+        int offset = 0;
+        while (offset < numSamples && isPlaying) {
+            int toWrite = Math.min(numSamples - offset, SAMPLE_RATE / 10); 
+            track.write(buffer, offset, toWrite);
+            offset += toWrite;
+        }
+    }
+
+    private void saveCurrentState(int lastDigit) {
+        SharedPreferences.Editor editor = getSharedPreferences(PREF_NAME, MODE_PRIVATE).edit();
+        editor.putString("q", piGenerator.q.toString());
+        editor.putString("r", piGenerator.r.toString());
+        editor.putString("t", piGenerator.t.toString());
+        editor.putString("k", piGenerator.k.toString());
+        editor.putString("n", piGenerator.n.toString());
+        editor.putString("l", piGenerator.l.toString());
+        editor.putString("lastDigit", String.valueOf(lastDigit));
+        editor.apply();
+    }
+
+    private void loadSavedState() {
+        SharedPreferences prefs = getSharedPreferences(PREF_NAME, MODE_PRIVATE);
+        String qStr = prefs.getString("q", null);
+        if (qStr != null) {
+            try {
+                piGenerator = new PiGenerator();
+                piGenerator.q = new BigInteger(qStr);
+                piGenerator.r = new BigInteger(prefs.getString("r", "0"));
+                piGenerator.t = new BigInteger(prefs.getString("t", "1"));
+                piGenerator.k = new BigInteger(prefs.getString("k", "1"));
+                piGenerator.n = new BigInteger(prefs.getString("n", "3"));
+                piGenerator.l = new BigInteger(prefs.getString("l", "3"));
+                String lastDigit = prefs.getString("lastDigit", "-");
+                tvCurrentDigit.setText(lastDigit);
+                btnResume.setEnabled(true);
+            } catch (Exception e) {
+                piGenerator = null;
+            }
+        }
+    }
+
+    private void clearSavedState() {
+        getSharedPreferences(PREF_NAME, MODE_PRIVATE).edit().clear().apply();
+    }
+
+    private static class PiGenerator {
+        BigInteger q = BigInteger.ONE, r = BigInteger.ZERO, t = BigInteger.ONE, 
+                   k = BigInteger.ONE, n = BigInteger.valueOf(3), l = BigInteger.valueOf(3);
+
+        public int nextDigit() {
+            while (true) {
+                if (q.multiply(BigInteger.valueOf(4)).add(r).subtract(t).compareTo(n.multiply(t)) < 0) {
+                    int digit = n.intValue();
+                    BigInteger nr = BigInteger.valueOf(10).multiply(r.subtract(n.multiply(t)));
+                    n = BigInteger.valueOf(10).multiply(BigInteger.valueOf(3).multiply(q).add(r)).divide(t).subtract(BigInteger.valueOf(10).multiply(n));
+                    q = q.multiply(BigInteger.valueOf(10));
+                    r = nr;
+                    return digit;
+                } else {
+                    BigInteger nr = BigInteger.valueOf(2).multiply(q).add(r).multiply(l);
+                    BigInteger nn = q.multiply(BigInteger.valueOf(7).multiply(k).add(BigInteger.valueOf(2))).add(r.multiply(l)).divide(t.multiply(l));
+                    q = q.multiply(k);
+                    t = t.multiply(l);
+                    l = l.add(BigInteger.valueOf(2));
+                    k = k.add(BigInteger.ONE);
+                    n = nn;
+                    r = nr;
+                }
+            }
+        }
+    }
+}
