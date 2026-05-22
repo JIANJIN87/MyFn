@@ -1,0 +1,503 @@
+package com.pi;
+
+import android.content.SharedPreferences;
+import android.media.AudioAttributes;
+import android.media.AudioFormat;
+import android.media.AudioTrack;
+import android.os.Bundle;
+import android.util.Log;
+import android.view.WindowManager;
+import android.widget.ArrayAdapter;
+import android.widget.Button;
+import android.widget.CheckBox;
+import android.widget.EditText;
+import android.widget.Spinner;
+import android.widget.TextView;
+
+import androidx.annotation.NonNull;
+import androidx.appcompat.app.AppCompatActivity;
+
+import java.math.BigInteger;
+import java.util.Random;
+
+public class MainActivity extends AppCompatActivity {
+
+    private static final String TAG = "PiSound";
+    private static final String PREF_NAME = "PiStatePrefs";
+    private static final int SAMPLE_RATE = 44100;
+    private static final double DEFAULT_FREQUENCY = 440.0;
+
+    // 0-9 映射到音阶频率 (C4 到 E5)
+    private static final double[] SYLLABLE_FREQS = {
+            261.63, // 0: C4 (Do)
+            293.66, // 1: D4 (Re)
+            329.63, // 2: E4 (Mi)
+            349.23, // 3: F4 (Fa)
+            392.00, // 4: G4 (Sol)
+            440.00, // 5: A4 (La)
+            493.88, // 6: B4 (Ti)
+            523.25, // 7: C5 (Do)
+            587.33, // 8: D5 (Re)
+            659.25  // 9: E5 (Mi)
+    };
+
+    // 时间比例逻辑 (黄金分割)
+    private static final double DURATION_LONG = 0.31415926;
+    private static final double DURATION_SHORT = 0.1942 / 1.618;
+    private static final double GAP_BIT = DURATION_SHORT / 1.618;
+
+    private volatile boolean isPlaying = false;
+    private Thread playThread;
+    private PiGenerator piGenerator;
+
+    private Button btnStart, btnPause, btnResume;
+    private TextView tvCurrentDigit;
+    private EditText etGapDigit, etRandomGapMin, etRandomGapMax;
+    private Spinner spInstrument, spRhythm;
+    private CheckBox cbSyllableMode, cbRandomMapping, cbRandomGap;
+    private final Random random = new Random();
+
+    // 当前激活的音符映射索引 (0-9 对应 SYLLABLE_FREQS 的下标)
+    private final int[] activeMapping = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        try {
+            super.onCreate(savedInstanceState);
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            setContentView(R.layout.activity_main);
+
+            btnStart = findViewById(R.id.btn_start);
+            btnPause = findViewById(R.id.btn_pause);
+            btnResume = findViewById(R.id.btn_resume);
+            Button btnRestart = findViewById(R.id.btn_restart);
+            tvCurrentDigit = findViewById(R.id.tv_current_digit);
+            etGapDigit = findViewById(R.id.et_gap_digit);
+            etRandomGapMin = findViewById(R.id.et_random_gap_min);
+            etRandomGapMax = findViewById(R.id.et_random_gap_max);
+            spInstrument = findViewById(R.id.sp_instrument);
+            spRhythm = findViewById(R.id.sp_rhythm);
+            cbSyllableMode = findViewById(R.id.cb_syllable_mode);
+            cbRandomMapping = findViewById(R.id.cb_random_mapping);
+            cbRandomGap = findViewById(R.id.cb_random_gap);
+
+            if (spInstrument != null) {
+                ArrayAdapter<CharSequence> adapter = ArrayAdapter.createFromResource(this,
+                        R.array.instrument_names, android.R.layout.simple_spinner_item);
+                adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+                spInstrument.setAdapter(adapter);
+            }
+
+            if (spRhythm != null) {
+                ArrayAdapter<CharSequence> adapter = ArrayAdapter.createFromResource(this,
+                        R.array.rhythm_names, android.R.layout.simple_spinner_item);
+                adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+                spRhythm.setAdapter(adapter);
+            }
+
+            if (cbSyllableMode != null && cbRandomMapping != null) {
+                TextView tvRhythmLabel = findViewById(R.id.tv_rhythm_label);
+                
+                boolean isSyllable = cbSyllableMode.isChecked();
+                cbRandomMapping.setEnabled(isSyllable);
+                if (spRhythm != null) spRhythm.setEnabled(isSyllable);
+                if (tvRhythmLabel != null) tvRhythmLabel.setEnabled(isSyllable);
+
+                cbSyllableMode.setOnCheckedChangeListener((buttonView, isChecked) -> {
+                    cbRandomMapping.setEnabled(isChecked);
+                    if (spRhythm != null) spRhythm.setEnabled(isChecked);
+                    if (tvRhythmLabel != null) tvRhythmLabel.setEnabled(isChecked);
+                    if (!isChecked) {
+                        cbRandomMapping.setChecked(false);
+                    }
+                });
+            }
+
+            if (cbRandomGap != null) {
+                TextView tvGapLabel = findViewById(R.id.tv_gap_label);
+                TextView tvMinLabel = findViewById(R.id.tv_random_gap_min_label);
+                TextView tvMaxLabel = findViewById(R.id.tv_random_gap_max_label);
+                
+                boolean initial = cbRandomGap.isChecked();
+                // 初始状态设置
+                if (etGapDigit != null) etGapDigit.setEnabled(!initial);
+                if (tvGapLabel != null) tvGapLabel.setEnabled(!initial);
+                
+                if (etRandomGapMin != null) etRandomGapMin.setEnabled(initial);
+                if (etRandomGapMax != null) etRandomGapMax.setEnabled(initial);
+                if (tvMinLabel != null) tvMinLabel.setEnabled(initial);
+                if (tvMaxLabel != null) tvMaxLabel.setEnabled(initial);
+
+                cbRandomGap.setOnCheckedChangeListener((buttonView, isChecked) -> {
+                    // 勾选随机停顿时，禁用固定停顿，启用随机范围
+                    if (etGapDigit != null) etGapDigit.setEnabled(!isChecked);
+                    if (tvGapLabel != null) tvGapLabel.setEnabled(!isChecked);
+                    
+                    if (etRandomGapMin != null) etRandomGapMin.setEnabled(isChecked);
+                    if (etRandomGapMax != null) etRandomGapMax.setEnabled(isChecked);
+                    if (tvMinLabel != null) tvMinLabel.setEnabled(isChecked);
+                    if (tvMaxLabel != null) tvMaxLabel.setEnabled(isChecked);
+                });
+            }
+
+            loadSavedState();
+
+            if (btnStart != null) {
+                btnStart.setOnClickListener(v -> {
+                    if (!isPlaying) {
+                        startPlayback();
+                    } else {
+                        stopPlayback();
+                    }
+                });
+            }
+
+            if (btnPause != null) btnPause.setOnClickListener(v -> pausePlayback());
+            if (btnResume != null) btnResume.setOnClickListener(v -> resumePlayback());
+            if (btnRestart != null) btnRestart.setOnClickListener(v -> resetAndStart());
+        } catch (Exception e) {
+            Log.e(TAG, "Crash in onCreate", e);
+        }
+    }
+
+    private void startPlayback() {
+        isPlaying = true;
+        if (piGenerator == null) {
+            piGenerator = new PiGenerator();
+            piGenerator.nextDigit();
+        }
+
+        // 只有在开始新会话时才决定是否随机映射
+        updateMapping();
+
+        if (btnStart != null) btnStart.setText(R.string.stop_program);
+        if (btnPause != null) btnPause.setEnabled(true);
+        if (btnResume != null) btnResume.setEnabled(false);
+        startPiThread();
+    }
+
+    private void stopPlayback() {
+        isPlaying = false;
+        if (playThread != null) {
+            playThread.interrupt();
+        }
+        if (btnStart != null) btnStart.setText(R.string.start_program);
+        if (btnPause != null) btnPause.setEnabled(false);
+        if (btnResume != null) btnResume.setEnabled(false);
+    }
+
+    private void pausePlayback() {
+        isPlaying = false;
+        if (playThread != null) {
+            playThread.interrupt();
+        }
+        if (btnPause != null) btnPause.setEnabled(false);
+        if (btnResume != null) btnResume.setEnabled(true);
+        if (btnStart != null) btnStart.setText(R.string.start_program);
+    }
+
+    private void resumePlayback() {
+        isPlaying = true;
+        if (btnPause != null) btnPause.setEnabled(true);
+        if (btnResume != null) btnResume.setEnabled(false);
+        if (btnStart != null) btnStart.setText(R.string.stop_program);
+        startPiThread();
+    }
+
+    private void resetAndStart() {
+        stopPlayback();
+        clearSavedState();
+        piGenerator = null;
+        if (tvCurrentDigit != null) tvCurrentDigit.setText(R.string.calculating);
+        startPlayback();
+    }
+
+    private void startPiThread() {
+        if (playThread != null && playThread.isAlive()) {
+            playThread.interrupt();
+        }
+
+        final int instrumentIndex = spInstrument != null ? spInstrument.getSelectedItemPosition() : 0;
+        final int rhythmIndex = spRhythm != null ? spRhythm.getSelectedItemPosition() : 0;
+        final boolean isSyllableMode = cbSyllableMode != null && cbSyllableMode.isChecked();
+
+        playThread = new Thread(() -> {
+            AudioTrack audioTrack = null;
+            try {
+                if (piGenerator == null) {
+                    piGenerator = new PiGenerator();
+                    piGenerator.nextDigit();
+                }
+
+                int minBufSize = AudioTrack.getMinBufferSize(SAMPLE_RATE,
+                        AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
+                int bufferSize = Math.max(minBufSize, 4096);
+
+                audioTrack = new AudioTrack.Builder()
+                        .setAudioAttributes(new AudioAttributes.Builder()
+                                .setUsage(AudioAttributes.USAGE_MEDIA)
+                                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                                .build())
+                        .setAudioFormat(new AudioFormat.Builder()
+                                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                .setSampleRate(SAMPLE_RATE)
+                                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                                .build())
+                        .setBufferSizeInBytes(bufferSize)
+                        .setTransferMode(AudioTrack.MODE_STREAM)
+                        .build();
+
+                audioTrack.play();
+
+                int noteCounter = 0;
+                while (isPlaying && !Thread.currentThread().isInterrupted()) {
+                    int digit = piGenerator.nextDigit();
+                    saveCurrentState(digit);
+
+                    final String digitStr = String.valueOf(digit);
+                    runOnUiThread(() -> {
+                        if (tvCurrentDigit != null) tvCurrentDigit.setText(digitStr);
+                    });
+
+                    if (isSyllableMode) {
+                        // 音阶模式：根据节奏模式决定音长
+                        int mappedIndex = activeMapping[digit % 10];
+                        double freq = SYLLABLE_FREQS[mappedIndex % 10];
+                        double duration = getRhythmDuration(rhythmIndex, noteCounter++);
+                        playInstrumentWave(audioTrack, duration, instrumentIndex, freq);
+                    } else {
+                        // 原有二进制模式
+                        String binStr = String.format("%4s", Integer.toBinaryString(digit)).replace(' ', '0');
+                        for (char bit : binStr.toCharArray()) {
+                            if (!isPlaying || Thread.currentThread().isInterrupted()) break;
+                            double duration = (bit == '0') ? DURATION_SHORT : DURATION_LONG;
+                            playInstrumentWave(audioTrack, duration, instrumentIndex, DEFAULT_FREQUENCY);
+                            safeSleep((long) (GAP_BIT * 1000));
+                        }
+                    }
+
+                    if (isPlaying && !Thread.currentThread().isInterrupted()) {
+                        long totalGap = parseGapTimes();
+                        if (totalGap > 0) {
+                            safeSleep(totalGap);
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "Runtime Error", e);
+            } finally {
+                if (audioTrack != null) {
+                    try {
+                        audioTrack.stop();
+                        audioTrack.release();
+                    } catch (Exception ignored) {}
+                }
+            }
+        });
+        playThread.start();
+    }
+
+    private void playInstrumentWave(@NonNull AudioTrack track, double duration, int instrumentIndex, double frequency) {
+        int numSamples = (int) (duration * SAMPLE_RATE);
+        short[] buffer = new short[numSamples];
+        
+        for (int i = 0; i < numSamples; i++) {
+            double t = (double) i / SAMPLE_RATE;
+            double angle = 2.0 * Math.PI * frequency * t;
+            double sample;
+
+            switch (instrumentIndex) {
+                case 1: // 电子琴 (方波)
+                    sample = Math.sin(angle) >= 0 ? 1.0 : -1.0;
+                    break;
+                case 2: // 笛子 (三角波)
+                    sample = Math.asin(Math.sin(angle)) * (2.0 / Math.PI);
+                    break;
+                case 3: // 小提琴 (锯齿波)
+                    double vibrato = 1.0 + 0.01 * Math.sin(2.0 * Math.PI * 5.0 * t);
+                    sample = (2.0 / Math.PI) * (vibrato * frequency * Math.PI * (t % (1.0 / (vibrato * frequency))) - (Math.PI / 2.0));
+                    break;
+                case 4: // 拨弦 (模拟钢琴/吉他 - 指数衰减)
+                    double decay = Math.exp(-4.0 * t / duration);
+                    sample = Math.sin(angle) * decay;
+                    sample += 0.5 * Math.sin(2 * angle) * decay * 0.5;
+                    break;
+                case 5: // 鸟鸣 (频率扫频)
+                    double freqBird = frequency * 2 + 1000 * Math.sin(2 * Math.PI * 10 * t);
+                    sample = Math.sin(2.0 * Math.PI * freqBird * t);
+                    break;
+                case 6: // 虫鸣 (快速脉冲)
+                    double pulse = Math.sin(2 * Math.PI * 50 * t);
+                    sample = (pulse > 0.9) ? Math.sin(2 * Math.PI * 8000 * t) : 0;
+                    break;
+                case 7: // 八音盒 (FM合成)
+                    double mod = 2.0 * Math.sin(2.0 * Math.PI * frequency * 2.0 * t);
+                    sample = Math.sin(angle + mod) * Math.exp(-2.0 * t / duration);
+                    break;
+                case 8: // 风笛 (叠加无人机音)
+                    sample = 0.6 * Math.sin(angle) + 0.2 * Math.sin(angle * 0.5) + 0.2 * Math.sin(angle * 1.5);
+                    if (Math.sin(angle) < 0) sample *= 0.8;
+                    break;
+                default: // 0: 默认 (正弦波)
+                    sample = Math.sin(angle);
+            }
+            
+            // 改进淡入淡出逻辑 (使用余弦曲线更平滑)
+            int fadeSamples = Math.min(numSamples / 10, 800); // 增加淡入淡出时间 (约18ms)
+            double envelope = 1.0;
+            if (i < fadeSamples) {
+                envelope = 0.5 * (1.0 - Math.cos(Math.PI * i / fadeSamples));
+            } else if (i > numSamples - fadeSamples) {
+                envelope = 0.5 * (1.0 - Math.cos(Math.PI * (numSamples - i) / fadeSamples));
+            }
+            
+            buffer[i] = (short) (sample * envelope * 32767 * 0.7); // 降低一点音量防止溢出
+        }
+        
+        track.write(buffer, 0, buffer.length);
+        safeSleep((long) (duration * 1000));
+    }
+
+    private long parseGapTimes() {
+        try {
+            if (cbRandomGap != null && cbRandomGap.isChecked()) {
+                // 随机模式：直接在 [下限, 上限] 之间取值
+                long min = Long.parseLong(etRandomGapMin.getText().toString().trim());
+                long max = Long.parseLong(etRandomGapMax.getText().toString().trim());
+                
+                if (max > min) {
+                    return min + random.nextInt((int) (max - min + 1));
+                } else {
+                    return min;
+                }
+            }
+            
+            // 固定模式：直接使用固定停顿值
+            return Long.parseLong(etGapDigit.getText().toString().trim());
+        } catch (Exception e) {
+            return 500;
+        }
+    }
+
+    private void safeSleep(long millis) {
+        try {
+            if (millis > 0) Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    // --- State Persistence ---
+
+    private void saveCurrentState(int lastDigit) {
+        if (piGenerator == null) return;
+        SharedPreferences.Editor editor = getSharedPreferences(PREF_NAME, MODE_PRIVATE).edit();
+        editor.putString("q", piGenerator.q.toString());
+        editor.putString("r", piGenerator.r.toString());
+        editor.putString("t", piGenerator.t.toString());
+        editor.putString("k", piGenerator.k.toString());
+        editor.putString("n", piGenerator.n.toString());
+        editor.putString("l", piGenerator.l.toString());
+        editor.putString("lastDigit", String.valueOf(lastDigit));
+        editor.apply();
+    }
+
+    private void loadSavedState() {
+        try {
+            SharedPreferences prefs = getSharedPreferences(PREF_NAME, MODE_PRIVATE);
+            String qStr = prefs.getString("q", null);
+            if (qStr != null && !qStr.isEmpty()) {
+                piGenerator = new PiGenerator();
+                piGenerator.q = new BigInteger(qStr);
+                piGenerator.r = new BigInteger(prefs.getString("r", "0"));
+                piGenerator.t = new BigInteger(prefs.getString("t", "1"));
+                piGenerator.k = new BigInteger(prefs.getString("k", "1"));
+                piGenerator.n = new BigInteger(prefs.getString("n", "3"));
+                piGenerator.l = new BigInteger(prefs.getString("l", "3"));
+
+                if (tvCurrentDigit != null) {
+                    tvCurrentDigit.setText(prefs.getString("lastDigit", "-"));
+                }
+                if (btnResume != null) {
+                    btnResume.setEnabled(true);
+                }
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to load state", e);
+            piGenerator = null;
+        }
+    }
+
+    private void clearSavedState() {
+        getSharedPreferences(PREF_NAME, MODE_PRIVATE).edit().clear().apply();
+    }
+
+    private void updateMapping() {
+        if (cbRandomMapping != null && cbRandomMapping.isChecked()) {
+            // Fisher-Yates 洗牌算法随机化 activeMapping
+            for (int i = 9; i > 0; i--) {
+                int j = random.nextInt(i + 1);
+                int temp = activeMapping[i];
+                activeMapping[i] = activeMapping[j];
+                activeMapping[j] = temp;
+            }
+        } else {
+            // 恢复默认映射 0->0, 1->1 ...
+            for (int i = 0; i < 10; i++) {
+                activeMapping[i] = i;
+            }
+        }
+    }
+
+    private double getRhythmDuration(int rhythmIndex, int index) {
+        switch (rhythmIndex) {
+            case 1: // 摇摆 (长-短)
+                return (index % 2 == 0) ? DURATION_LONG * 1.5 : DURATION_LONG * 0.5;
+            case 2: // 圆舞曲 (强-弱-弱 -> 长-短-短)
+                return (index % 3 == 0) ? DURATION_LONG * 1.5 : DURATION_LONG * 0.75;
+            case 3: // 探戈 (长-长-短-短)
+                int stepTango = index % 4;
+                return (stepTango < 2) ? DURATION_LONG * 1.2 : DURATION_LONG * 0.6;
+            case 4: // 断奏 (短促)
+                return DURATION_LONG * 0.3;
+            case 5: // 奔马 (短-短-长)
+                return (index % 3 == 2) ? DURATION_LONG * 1.5 : DURATION_LONG * 0.5;
+            case 6: // 心跳 (双跳)
+                return (index % 2 == 0) ? DURATION_LONG * 0.4 : DURATION_LONG * 0.8;
+            case 7: // 随机节奏
+                return DURATION_LONG * (0.3 + random.nextDouble() * 1.5);
+            default: // 0: 等长
+                return DURATION_LONG;
+        }
+    }
+
+    // --- Pi Spigot Algorithm ---
+
+    private static class PiGenerator {
+        BigInteger q = BigInteger.ONE, r = BigInteger.ZERO, t = BigInteger.ONE,
+                k = BigInteger.ONE, n = BigInteger.valueOf(3), l = BigInteger.valueOf(3);
+
+        public int nextDigit() {
+            while (true) {
+                BigInteger q4r_t = q.shiftLeft(2).add(r).subtract(t);
+                BigInteger nt = n.multiply(t);
+                if (q4r_t.compareTo(nt) < 0) {
+                    int digit = n.intValue();
+                    r = r.subtract(nt).multiply(BigInteger.valueOf(10));
+                    n = q.multiply(BigInteger.valueOf(3)).add(r).divide(t).subtract(BigInteger.valueOf(10).multiply(BigInteger.valueOf(digit)));
+                    q = q.multiply(BigInteger.valueOf(10));
+                    return digit;
+                } else {
+                    BigInteger nr = q.shiftLeft(1).add(r).multiply(l);
+                    BigInteger nn = q.multiply(k.multiply(BigInteger.valueOf(7)).add(BigInteger.valueOf(2))).add(r.multiply(l)).divide(t.multiply(l));
+                    q = q.multiply(k);
+                    t = t.multiply(l);
+                    l = l.add(BigInteger.valueOf(2));
+                    k = k.add(BigInteger.ONE);
+                    n = nn;
+                    r = nr;
+                }
+            }
+        }
+    }
+}
